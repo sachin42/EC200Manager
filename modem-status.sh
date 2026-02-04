@@ -67,6 +67,22 @@ else
 fi
 echo ""
 
+# Show reconnection statistics
+echo "Reconnection Statistics:"
+if [ -f /var/log/modem-reconnect-stats.json ]; then
+    if command -v jq &>/dev/null; then
+        TOTAL=$(jq -r '.total_reconnections' /var/log/modem-reconnect-stats.json 2>/dev/null)
+        LAST=$(jq -r '.last_reconnection' /var/log/modem-reconnect-stats.json 2>/dev/null)
+        echo "  Total reconnections: $TOTAL"
+        [ "$LAST" != "null" ] && echo "  Last reconnection: $LAST"
+    else
+        echo "  Install 'jq' to view stats (or check /var/log/modem-reconnect-stats.json)"
+    fi
+else
+    echo "  No reconnections recorded yet"
+fi
+echo ""
+
 # Show recent log entries
 echo "Recent Activity (last 10 lines):"
 if [ -f /var/log/modem-manager.log ]; then

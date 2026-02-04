@@ -4,7 +4,7 @@ EC200G Modem Internet Connection Manager - Simplified
 - Enables internet on modem startup
 - Monitors usb0 for IP address
 - Re-sends AT command when IP is lost
-- No interface management or DHCP - just AT commands
+- Tracks reconnection statistics permanently
 """
 
 import serial
@@ -14,6 +14,7 @@ import glob
 import subprocess
 import sys
 import logging
+import json
 from datetime import datetime
 
 # Configuration
@@ -22,6 +23,8 @@ RETRY_INTERVAL = 60  # Retry failed commands after 60 seconds
 STARTUP_DELAY = 10   # Wait 10 seconds on startup
 AT_TIMEOUT = 5       # AT command timeout
 LOG_FILE = '/var/log/modem-manager.log'
+STATS_FILE = '/var/log/modem-reconnect-stats.json'
+RECONNECT_LOG = '/var/log/modem-reconnections.log'
 
 # Setup logging
 logging.basicConfig(
@@ -33,6 +36,58 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+def load_stats():
+    """Load reconnection statistics from file"""
+    try:
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load stats: {e}")
+    
+    # Return default stats
+    return {
+        'total_reconnections': 0,
+        'last_reconnection': None,
+        'first_reconnection': None,
+        'startup_time': datetime.now().isoformat()
+    }
+
+def save_stats(stats):
+    """Save reconnection statistics to file"""
+    try:
+        with open(STATS_FILE, 'w') as f:
+            json.dump(stats, f, indent=2)
+    except Exception as e:
+        logger.error(f"Could not save stats: {e}")
+
+def log_reconnection(reason='no_ip'):
+    """Log a successful reconnection event"""
+    timestamp = datetime.now().isoformat()
+    
+    # Load current stats
+    stats = load_stats()
+    
+    # Update stats
+    stats['total_reconnections'] += 1
+    stats['last_reconnection'] = timestamp
+    if stats['first_reconnection'] is None:
+        stats['first_reconnection'] = timestamp
+    
+    # Save updated stats
+    save_stats(stats)
+    
+    # Append to permanent reconnection log
+    try:
+        with open(RECONNECT_LOG, 'a') as f:
+            f.write(f"{timestamp} - Reconnection #{stats['total_reconnections']} - Reason: {reason}\n")
+    except Exception as e:
+        logger.error(f"Could not write to reconnection log: {e}")
+    
+    logger.info(f"📊 Reconnection logged - Total count: {stats['total_reconnections']}")
+    
+    return stats['total_reconnections']
 
 def get_rs485_port():
     """Get the actual ttyUSB device that rs485 symlink points to"""
@@ -103,15 +158,21 @@ def test_at_command(port, command):
     response = send_at_command(port, command, timeout=2)
     return response and 'OK' in response
 
-def enable_modem_internet(port):
+def enable_modem_internet(port, is_recovery=False):
     """Enable internet on modem using AT command"""
-    logger.info(f"Enabling internet on modem ({port})...")
+    if is_recovery:
+        logger.info(f"Re-enabling internet on modem ({port})...")
+    else:
+        logger.info(f"Enabling internet on modem ({port})...")
     
     response = send_at_command(port, 'AT+QNETDEVCTL=1,1,1', timeout=10)
     
     if response:
         if 'OK' in response:
-            logger.info("✓ Modem internet enabled successfully")
+            if is_recovery:
+                logger.info("✓ Modem internet re-enabled successfully")
+            else:
+                logger.info("✓ Modem internet enabled successfully")
             return True
         elif 'ERROR' in response:
             logger.error(f"✗ Modem returned error: {response.strip()}")
@@ -161,6 +222,15 @@ def main():
     logger.info("EC200G Modem Internet Manager Starting...")
     logger.info("="*60)
     
+    # Load and display current stats
+    stats = load_stats()
+    logger.info(f"Reconnection Statistics:")
+    logger.info(f"   Total reconnections: {stats['total_reconnections']}")
+    if stats['last_reconnection']:
+        logger.info(f"   Last reconnection: {stats['last_reconnection']}")
+    logger.info(f"   Stats file: {STATS_FILE}")
+    logger.info(f"   Reconnection log: {RECONNECT_LOG}")
+    
     # Startup delay
     if STARTUP_DELAY > 0:
         logger.info(f"Waiting {STARTUP_DELAY} seconds for modem to initialize...")
@@ -183,7 +253,7 @@ def main():
             logger.info(f"Retry {retry_count}/{max_retries} after {RETRY_INTERVAL}s...")
             time.sleep(RETRY_INTERVAL)
         
-        success = enable_modem_internet(modem_port)
+        success = enable_modem_internet(modem_port, is_recovery=False)
         retry_count += 1
     
     if not success:
@@ -214,10 +284,18 @@ def main():
                 
                 # Try to re-enable modem internet
                 logger.info("Attempting to re-enable modem internet...")
-                if enable_modem_internet(modem_port):
+                if enable_modem_internet(modem_port, is_recovery=True):
                     logger.info("Waiting 30 seconds for interface...")
                     time.sleep(30)
-                    consecutive_failures = 0
+                    
+                    # Check if interface appeared
+                    if check_interface_exists('usb0'):
+                        # Log successful reconnection
+                        count = log_reconnection(reason='interface_missing')
+                        logger.info(f"Interface restored (Total reconnections: {count})")
+                        consecutive_failures = 0
+                    else:
+                        logger.warning("Interface still missing after re-enable")
                 else:
                     logger.error("Failed to re-enable modem internet")
                     if consecutive_failures >= 3:
@@ -244,14 +322,16 @@ def main():
                 
                 # Re-enable modem internet to get IP
                 logger.info("Re-enabling modem internet to restore IP...")
-                if enable_modem_internet(modem_port):
+                if enable_modem_internet(modem_port, is_recovery=True):
                     logger.info("Waiting 30 seconds for IP assignment...")
                     time.sleep(30)
                     
                     # Check if we got IP
                     new_ip = get_interface_ip('usb0')
                     if new_ip:
-                        logger.info(f"✓ IP restored: {new_ip}")
+                        # Log successful reconnection
+                        count = log_reconnection(reason='no_ip')
+                        logger.info(f"✓ IP restored: {new_ip} (Total reconnections: {count})")
                         last_ip = new_ip
                         consecutive_failures = 0
                     else:
